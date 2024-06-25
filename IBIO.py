@@ -1,17 +1,34 @@
-import datetime
 import json
 import os
 import re
-from random import choice
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 from typing import Optional
-
+from pytube import YouTube
 import disnake
 import dpath.util
 import requests
 import yt_dlp as youtube_dl
 from disnake.ext import commands
 from disnake.utils import get
+import asyncio
+import time
+
+
+last_call_time = 0
+CALL_LIMIT = 10  # Минимальный интервал между вызовами в секундах
+
+
+def rate_limited(func):
+    async def wrapper(*args, **kwargs):
+        global last_call_time
+        current_time = time.time()
+        if current_time - last_call_time < CALL_LIMIT:
+            await asyncio.sleep(CALL_LIMIT - (current_time - last_call_time))
+        last_call_time = time.time()
+        return await func(*args, **kwargs)
+    return wrapper
+
+
 musics = list()
 commander = '*'
 intents = disnake.Intents.all()
@@ -71,40 +88,62 @@ def search_youtube(text_or_url: str) -> List[Tuple[str, str]]:
     return items
 
 
+ytdl_format_options = {
+    'format': 'bestaudio/best',
+    'postprocessors': [{
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': 'mp3',
+        'preferredquality': '192',
+    }],
+    'socket_timeout': 300,
+}
+
+ffmpeg_options = {
+    'options': '-vn'
+}
+
+ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
+
+
+class YTDLSource(disnake.PCMVolumeTransformer):
+    def __init__(self, source, *, data, volume=0.5):
+        super().__init__(source, volume)
+        self.data = data
+
+        self.title = data.get('title')
+        self.url = data.get('url')
+
+    @classmethod
+    async def from_url(cls, url, *, loop=None, stream=True):
+        loop = loop or asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
+
+        if 'entries' in data:
+            data = data['entries'][0]
+
+        filename = data['url'] if stream else ytdl.prepare_filename(data)
+        return cls(disnake.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+
+
 class Platform(disnake.ui.View):
     def __int__(self):
         super().__init__()
 
-    @disnake.ui.button(style=disnake.ButtonStyle.gray, label="<<")
-    async def last(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
-        global vo, now_number, p_r, flag_repeat
-        if now_number >= 1:
-            now_number -= 2
-            p_r = False
-            flag_repeat = False
-            vo.stop()
-        await inter.send('Назад', ephemeral=True)
+    @disnake.ui.button(style=disnake.ButtonStyle.gray, emoji="⏹")
+    async def skip(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
+        vo.stop()
+        await inter.send('Скип', ephemeral=True)
 
-    @disnake.ui.button(style=disnake.ButtonStyle.gray, label="||")
-    async def pause_resume(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
-        global vo, p_r
-        p_r = True if not p_r else False
-        if p_r:
-            vo.pause()
-        else:
-            vo.resume()
-        await inter.send('пауза', ephemeral=True)
+    @disnake.ui.button(style=disnake.ButtonStyle.gray, emoji="🛂")
+    async def list(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
+        with open(f'data/{inter.author.id}.txt', mode='rt', encoding='utf-8') as file:
+            opt = list()
+            file = (file.read()).split('\n')
+            for i in file:
+                opt.append(disnake.SelectOption(label=i))
+            await inter.send(view=DropDownView(opt), ephemeral=True)
 
-    @disnake.ui.button(style=disnake.ButtonStyle.gray, label='>>')
-    async def next(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
-        global vo, p_r, flag_repeat
-        if now_number != global_number:
-            p_r = False
-            flag_repeat = False
-            vo.stop()
-        await inter.send('Вперёд', ephemeral=True)
-
-    @disnake.ui.button(style=disnake.ButtonStyle.gray, label="повторять")
+    @disnake.ui.button(style=disnake.ButtonStyle.gray, emoji="🔃")
     async def repeat(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
         global flag_repeat
         flag_repeat = True if not flag_repeat else False
@@ -112,7 +151,6 @@ class Platform(disnake.ui.View):
             await inter.send('теперь ваш трек будет повторяться', ephemeral=True)
         else:
             await inter.send('снимаю повторение трека', ephemeral=True)
-        self.value = True
 
     @disnake.ui.button(style=disnake.ButtonStyle.red, label='❤')
     async def like(self, button: disnake.ui.Button, ctx: disnake.CommandInteraction):
@@ -154,78 +192,48 @@ class DropDownView(disnake.ui.View):
         self.add_item(Dropdown(pool))
 
 
-def musicon(ctx, file):
-    global flag_on
-    vo.play(disnake.FFmpegPCMAudio(file), after=lambda e: nextmus(ctx))
-    vo.source = disnake.PCMVolumeTransformer(vo.source)
-    vo.source.volume = 1
-    flag_on = True
-
-
-def nextmus(ctx):
-    global now_number, flag_on
-    flag_on = False
-    if now_number <= global_number:
-        if not flag_repeat and now_number < global_number:
+def next_mus(ctx):
+    async def mus():
+        global now_number, flag_on
+        flag_on = False
+        if now_number < len(musics) - 1:
             now_number += 1
-            musicon(ctx, f'mus/mus{now_number}.mp3')
-        elif flag_repeat:
-            musicon(ctx, f'mus/mus{now_number}.mp3')
-    print(f'INFORMATION <nextmus>: now: {now_number} global: {global_number}')
-
-
-@ibio.command()
-async def information(ctx):
-    emb = disnake.Embed(title='Your title', color=disnake.Color.from_rgb(57, 47, 44))
-    emb.set_author(name=ibio.user.name, icon_url=ibio.user.avatar)
-    emb.set_image(url=ibio.user.avatar)
-    emb.add_field(name='Title:', value='dadada')
-    await ctx.message.delete()
-    await ctx.send(embed=emb)
+            url = musics[now_number]
+            if 'http' not in musics[now_number]:
+                url = (search_youtube(musics[now_number]))[0][0]
+            player = await YTDLSource.from_url(url, loop=ibio.loop, stream=True)
+            vo.play(player, after=lambda e: next_mus(ctx))
+    asyncio.run_coroutine_threadsafe(mus(), ibio.loop)
 
 
 @ibio.slash_command(name='play', description='запускает вашу музыку')
 async def play(ctx: disnake.CommandInteraction, url):
-    global vo, ydl_opts, flag_stop, global_number, now_number, p_r
-    print(url)
-    if flag_stop:
-        for i in os.listdir('./mus'):
-            os.remove(f'mus/{i}')
-        flag_stop = False
-    if url:
-        vo = get(ibio.voice_clients, guild=ctx.guild)
+    global vo, flag_on, global_number
+    if 'http' not in url:
+        url = (search_youtube(url))[0][0]
+    musics.append(url)
+    if flag_on:
+        await ctx.send("Ваш трек добавлен в очередь", ephemeral=True)
+    else:
+        await ctx.send("Запуск...", ephemeral=True)
         chanel = ctx.author.voice.channel
+        if not chanel:
+            await ctx.send("Вы не подключены к голосовому каналу.")
+            return
+        vo = get(ibio.voice_clients, guild=ctx.guild)
         if vo and vo.is_connected():
             await vo.move_to(chanel)
         else:
             vo = await chanel.connect()
-        print(f'INFORMATION <play>: now: {now_number} global: {global_number}')
-        await ctx.send('подождите пару секунд', ephemeral=True)
-        if 'https://' in url:
-            youtube_dl.YoutubeDL(ydl_opts).download([url])
-        else:
-            youtube_dl.YoutubeDL(ydl_opts).download([(search_youtube(url))[0][0]])
-        for file in os.listdir('./'):
-            if file.endswith('.opus'):
-                global_number += 1
-                musics.append((((file.split('.opus'))[0]).split('['))[0])
-                os.rename(file, f'mus/mus{global_number}.mp3')
-        if global_number == now_number or not flag_on:
-            p_r = False
-            now_number = global_number
-            musicon(ctx, f'mus/mus{global_number}.mp3')
-        emb = disnake.Embed(title='Плейлист', color=disnake.Color.from_rgb(250, 235, 214))
-        emb.set_author(name=ctx.author.name, icon_url=ctx.author.avatar)
-        output = []
-        ch = len(musics) - 5 if len(musics) >= 5 else 0
-        for i in range(ch, len(musics)):
-            if i == now_number:
-                output.append(f'{i + 1}.**{musics[i]}** <-- сейчас играет')
-            else:
-                output.append(f'{i + 1}. {musics[i]}')
-        output = '\n'.join(output)
-        emb.add_field(name='', value=output)
-        await ctx.channel.send(embed=emb)
+        player = await YTDLSource.from_url(url, loop=asyncio.get_event_loop(), stream=True)
+        flag_on = True
+        vo.play(player, after=lambda e: next_mus(ctx))
+    emb = disnake.Embed(title=f'{YouTube(musics[now_number]).title}', color=disnake.Color.from_rgb(250, 235, 214))
+    emb.set_author(name=ctx.author.name, icon_url=ctx.author.avatar)
+    view = Platform()
+    output = '\n'.join([YouTube(mus).title for mus in musics[-3:]])
+    emb.add_field(name='', value=output)
+    await ctx.channel.send(embed=emb, view=view)
 
 
 @ibio.slash_command(name='panel', description='открывает панель управления ботом')
@@ -240,4 +248,30 @@ async def panel(ctx: disnake.CommandInteraction):
     await view.wait()
 
 
+# @ibio.event
+# async def on_command_error(ctx, error):
+#     if isinstance(error, commands.CommandInvokeError) and isinstance(error.original, disnake.errors.HTTPException):
+#         if error.original.status == 429:
+#             retry_after = int(error.original.response.headers.get('Retry-After', 1))
+#             await ctx.send(f"Rate limit exceeded. Retrying after {retry_after} seconds.")
+#             await asyncio.sleep(retry_after)
+#             await ctx.reinvoke()
+#         else:
+#             await ctx.send(f"An error occurred: {error.original}")
+#     else:
+#         await ctx.send(f"An error occurred: {error}")
+#
+#
+# async def start_bot():
+#     try:
+#         await ibio.start(TOKEN)
+#     except disnake.errors.HTTPException as e:
+#         if e.status == 429:
+#             retry_after = int(e.response.headers.get('Retry-After', 1))
+#             print(f'Rate limit exceeded. Retrying after {retry_after} seconds.')
+#             await asyncio.sleep(retry_after)
+#             await start_bot()
+#
+#
+# asyncio.run(start_bot())
 ibio.run(TOKEN)
