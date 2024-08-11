@@ -29,22 +29,11 @@ def rate_limited(func):
     return wrapper
 
 
-musics = list()
+musics = dict()
 commander = '*'
 intents = disnake.Intents.all()
 TOKEN = ""
 ibio = commands.Bot(intents=intents, command_prefix=commander)
-ydl_opts = {'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredquality': '192'}]}
-stopped = list()
-p_r = False
-flag_repeat = False
-flag_stop = True
-flag_on = False
-global_number = -1
-now_number = 0
 USER_AGENT = 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:45.0) Gecko/20100101 Firefox/45.0'
 PATTERNS = [
     re.compile(r'window\["ytInitialData"\] = (\{.+?\});'),
@@ -89,16 +78,17 @@ def search_youtube(text_or_url: str) -> List[Tuple[str, str]]:
 
 
 ytdl_format_options = {
-    'format': 'bestaudio/best',
+    'format': 'bestaudio',
     'postprocessors': [{
         'key': 'FFmpegExtractAudio',
         'preferredcodec': 'mp3',
         'preferredquality': '192',
     }],
-    'socket_timeout': 300,
+    'socket_timeout': 120,
 }
 
 ffmpeg_options = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn'
 }
 
@@ -109,7 +99,6 @@ class YTDLSource(disnake.PCMVolumeTransformer):
     def __init__(self, source, *, data, volume=0.5):
         super().__init__(source, volume)
         self.data = data
-
         self.title = data.get('title')
         self.url = data.get('url')
 
@@ -131,6 +120,7 @@ class Platform(disnake.ui.View):
 
     @disnake.ui.button(style=disnake.ButtonStyle.gray, emoji="⏹")
     async def skip(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
+        vo = get(ibio.voice_clients, guild=inter.guild)
         vo.stop()
         await inter.send('Скип', ephemeral=True)
 
@@ -138,9 +128,9 @@ class Platform(disnake.ui.View):
     async def list(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
         with open(f'data/{inter.author.id}.txt', mode='rt', encoding='utf-8') as file:
             opt = list()
-            file = (file.read()).split('\n')
+            file = file.read().split('\n')
             for i in file:
-                opt.append(disnake.SelectOption(label=i))
+                opt.append(disnake.SelectOption(label=YouTube(i).title, value=i))
             await inter.send(view=DropDownView(opt), ephemeral=True)
 
     @disnake.ui.button(style=disnake.ButtonStyle.gray, emoji="🔃")
@@ -154,17 +144,17 @@ class Platform(disnake.ui.View):
 
     @disnake.ui.button(style=disnake.ButtonStyle.red, label='❤')
     async def like(self, button: disnake.ui.Button, ctx: disnake.CommandInteraction):
-        await ctx.send(musics[now_number], ephemeral=True)
+        await ctx.send(YouTube(musics[ctx.guild.id][0]).title, ephemeral=True)
         fib = os.listdir('./data')
         if f'{ctx.author.id}.txt' in fib:
             with open(f'data/{ctx.author.id}.txt', mode='rt', encoding='utf-8') as file:
                 file = (file.read()).split('\n')
-                if musics[now_number] not in file:
+                if musics[ctx.guild.id][0] not in file:
                     with open(f'data/{ctx.author.id}.txt', mode='a', encoding='utf-8') as file:
-                        file.write(f'\n{musics[now_number]}')
+                        file.write(f'\n{musics[ctx.guild.id][0]}')
         else:
             with open(f'data/{ctx.author.id}.txt', mode='w', encoding='utf-8') as file:
-                file.write(f'{musics[now_number]}')
+                file.write(f'{musics[ctx.guild.id][0]}')
 
 
 @ibio.slash_command(name='favorites', description='ваши любимы треки')
@@ -194,25 +184,37 @@ class DropDownView(disnake.ui.View):
 
 def next_mus(ctx):
     async def mus():
-        global now_number, flag_on
-        flag_on = False
-        if now_number < len(musics) - 1:
-            now_number += 1
-            url = musics[now_number]
-            if 'http' not in musics[now_number]:
-                url = (search_youtube(musics[now_number]))[0][0]
-            player = await YTDLSource.from_url(url, loop=ibio.loop, stream=True)
-            vo.play(player, after=lambda e: next_mus(ctx))
+        musics[ctx.guild.id] = musics[ctx.guild.id][1:]
+        vo = get(ibio.voice_clients, guild=ctx.guild)
+        if not musics[ctx.guild.id]:
+            await vo.disconnect()
+            return
+        url = musics[ctx.guild.id][0]
+        player = await YTDLSource.from_url(url, loop=asyncio.get_event_loop(), stream=True)
+        vo.play(player, after=lambda e: next_mus(ctx))
     asyncio.run_coroutine_threadsafe(mus(), ibio.loop)
+
+
+def add_server(ctx):
+    server = ctx.guild
+    if server.id not in musics:
+        musics[ctx.guild.id] = list()
+
+
+@ibio.slash_command(name='dis', description='kfdsf')
+async def dis(ctx: disnake.CommandInteraction):
+    vo = get(ibio.voice_clients, guild=ctx.guild)
+    musics[ctx.guild.id] = list()
+    await vo.disconnect()
 
 
 @ibio.slash_command(name='play', description='запускает вашу музыку')
 async def play(ctx: disnake.CommandInteraction, url):
-    global vo, flag_on, global_number
+    add_server(ctx)
     if 'http' not in url:
         url = (search_youtube(url))[0][0]
-    musics.append(url)
-    if flag_on:
+    musics[ctx.guild.id].append(url)
+    if len(musics[ctx.guild.id]) > 1:
         await ctx.send("Ваш трек добавлен в очередь", ephemeral=True)
     else:
         await ctx.send("Запуск...", ephemeral=True)
@@ -226,24 +228,21 @@ async def play(ctx: disnake.CommandInteraction, url):
         else:
             vo = await chanel.connect()
         player = await YTDLSource.from_url(url, loop=asyncio.get_event_loop(), stream=True)
-        flag_on = True
         vo.play(player, after=lambda e: next_mus(ctx))
-    emb = disnake.Embed(title=f'{YouTube(musics[now_number]).title}', color=disnake.Color.from_rgb(250, 235, 214))
+    emb = disnake.Embed(title=f'{YouTube(musics[ctx.guild.id][-1]).title}', color=disnake.Color.from_rgb(250, 235, 214))
     emb.set_author(name=ctx.author.name, icon_url=ctx.author.avatar)
-    view = Platform()
-    output = '\n'.join([YouTube(mus).title for mus in musics[-3:]])
+    view = Platform(timeout=None)
+    output = '\n'.join([YouTube(mus).title for mus in musics[ctx.guild.id][-3:]])
     emb.add_field(name='', value=output)
     await ctx.channel.send(embed=emb, view=view)
 
 
 @ibio.slash_command(name='panel', description='открывает панель управления ботом')
 async def panel(ctx: disnake.CommandInteraction):
-    global vo
     emb = disnake.Embed(title='Панель управления', color=disnake.Color.from_rgb(57, 47, 44))
     emb.set_author(name=ibio.user.name, icon_url=ibio.user.avatar)
     emb.set_footer(text=ctx.author.name, icon_url=ctx.author.avatar)
-    emb.set_image(url=ibio.user.avatar)
-    view = Platform()
+    view = Platform(timeout=None)
     await ctx.send(embed=emb, view=view)
     await view.wait()
 
